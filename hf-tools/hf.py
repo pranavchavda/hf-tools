@@ -295,13 +295,26 @@ def cmd_login(args):
         login_body = {"mobileNumber": mobile, "ucc": ucc, "totp": totp_code}
         
         login_resp = _rest_post(login_url, login_body)
-        # If first attempt fails with 400, retry with fresh TOTP once
+        
+        # Retry with fresh TOTP if first attempt failed (Kotak's API often 400s on first call)
         if login_resp.get("error") and any(
             e.get("code") == "400" for e in (login_resp.get("error") or [])
         ):
             import time as _time
             _time.sleep(0.5)
             totp_code = pyotp.TOTP(totp_key).now() if totp_key else pyotp.TOTP(totp_key).now()
+            login_body["totp"] = totp_code
+            login_resp = _rest_post(login_url, login_body)
+        
+        # Try with masked +91 format as third fallback
+        if login_resp.get("error") and any(
+            e.get("code") == "400" for e in (login_resp.get("error") or [])
+        ) and mobile and len(mobile) == 10 and mobile.isdigit():
+            import time as _time
+            _time.sleep(0.3)
+            totp_code = pyotp.TOTP(totp_key).now()
+            alt_mobile = "+919****" + mobile[-4:]
+            login_body["mobileNumber"] = alt_mobile
             login_body["totp"] = totp_code
             login_resp = _rest_post(login_url, login_body)
         
