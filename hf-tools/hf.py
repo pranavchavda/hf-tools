@@ -290,32 +290,29 @@ def cmd_login(args):
                 except _json.JSONDecodeError:
                     return {"error": [{"message": err_body}]}
         
-        # Step 1: TOTP Login (with warm-up retry — first call to Kotak often 400s)
+        # Step 1: TOTP Login (with warm-up retry and format fallback)
         totp_code = pyotp.TOTP(totp_key).now() if totp_key else totp_code
         login_body = {"mobileNumber": mobile, "ucc": ucc, "totp": totp_code}
         
         login_resp = _rest_post(login_url, login_body)
         
         # Retry with fresh TOTP if first attempt failed (Kotak's API often 400s on first call)
-        if login_resp.get("error") and any(
+        attempts = 0
+        while login_resp.get("error") and any(
             e.get("code") == "400" for e in (login_resp.get("error") or [])
-        ):
+        ) and attempts < 2:
             import time as _time
             _time.sleep(0.5)
+            attempts += 1
             totp_code = pyotp.TOTP(totp_key).now() if totp_key else pyotp.TOTP(totp_key).now()
             login_body["totp"] = totp_code
-            login_resp = _rest_post(login_url, login_body)
-        
-        # Try with masked +91 format as third fallback
-        if login_resp.get("error") and any(
-            e.get("code") == "400" for e in (login_resp.get("error") or [])
-        ) and mobile and len(mobile) == 10 and mobile.isdigit():
-            import time as _time
-            _time.sleep(0.3)
-            totp_code = pyotp.TOTP(totp_key).now()
-            alt_mobile = "+919****" + mobile[-4:]
-            login_body["mobileNumber"] = alt_mobile
-            login_body["totp"] = totp_code
+            
+            # Try adding/removing +91 prefix as fallback
+            mn = login_body.get("mobileNumber", mobile)
+            if "+91" not in mn and len(mn) == 10 and mn.isdigit():
+                login_body["mobileNumber"] = "+91" + mn
+            elif mn.startswith("+91") and len(mn) == 13:
+                login_body["mobileNumber"] = mn[3:]  # remove +91 prefix
             login_resp = _rest_post(login_url, login_body)
         
         if not login_resp.get("data") or not login_resp["data"].get("token"):
@@ -326,14 +323,28 @@ def cmd_login(args):
         
         login_data = login_resp["data"]
         
-        # Step 2: Validate with MPIN
-        validate_body = {
-            "token": login_data["token"],
+        # Step 2: Validate with MPIN (needs sid + Auth headers from login response)
+        validate_headers = {
+            "Authorization": consumer_key,
             "sid": login_data["sid"],
-            "rid": login_data["rid"],
-            "mpin": mpin,
+            "Auth": login_data["token"],
+            "neo-fin-key": env.get("neo_fin_key") or "neotradeapi",
+            "Content-Type": "application/json",
         }
-        validate_resp = _rest_post(validate_url, validate_body)
+        validate_body = {"mpin": mpin}
+        validate_data_bytes = json.dumps(validate_body).encode("utf-8")
+        validate_req = urllib.request.Request(
+            validate_url, data=validate_data_bytes, headers=validate_headers, method="POST"
+        )
+        try:
+            with urllib.request.urlopen(validate_req, timeout=15) as resp:
+                validate_resp = json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            err_body = e.read().decode("utf-8")
+            try:
+                validate_resp = json.loads(err_body)
+            except json.JSONDecodeError:
+                validate_resp = {"error": [{"message": err_body}]}
         
         if not validate_resp.get("data") or not validate_resp["data"].get("token"):
             err_msg = validate_resp.get("error", [{}])
